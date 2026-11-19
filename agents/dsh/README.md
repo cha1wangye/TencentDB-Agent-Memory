@@ -341,6 +341,39 @@ dsh 有独特的 headless bypass:
 
 允许 dsh 在 API 直调 / batch 模式(有自定义 tools 但没交互 tool)正常工作。
 
+#### 3.5.1 Headless 默认身份绑定(opt-in)
+
+headless 请求默认**不登记** team/agent/task,于是 session trace 上传
+(`/v3/session/add`) 不带 `x-tdai-team-id`,MemoryCore 只能把每一轮写到
+`sessions/online/_unassigned/<user>/<session>/` —— 这些会话永远不归并成 L1/L2
+记忆,后续也检索不到。
+
+在 proxy 的 `config.yaml` 里配置(见 `MemoryProxy/config.example.yaml` 的
+`sessionInit` 段):
+
+```yaml
+sessionInit:
+  defaultTeamId: "team-xxxxxxxxxx"   # 必须与 defaultAgentId 同时配置
+  defaultAgentId: "agt-xxxxxxxxxx"
+  # defaultTaskId: "task-xxxxxxxxxx" # 可选；默认值 "default" = 不绑定 task
+```
+
+生效条件与行为:
+
+- 仅 `agentSource=dsh`。命中条件:headless(tools 非空但没有 `ask_user_question`)
+  **或** `sessionInit.enabled=false`。
+- 登记走与「表单选择完成」相同的 `completeRegistration` 路径:写
+  `SessionInitState` / L2a 状态 / L2b binding / `sessionInfo`,所以后续轮次、
+  注入器、session trace 都能拿到 team/agent(/task)。
+- 登记前用内核列表校验:team / agent 不可见 → 只打 warn 并保持未绑定;
+  task 查不到 → 降级为只绑 team + agent。绝不回退弹表单(headless 弹表单客户端
+  会报 unknown tool)。
+- 已有绑定的会话保持原绑定,不会被覆盖;交互式请求(带 `ask_user_question` 且
+  `sessionInit.enabled=true`)完全不走这条路径。
+- **不配置这两个字段 → 行为与历史完全一致**(headless 仍然 bypass、不绑定)。
+- 日志:`[session-init:dsh-default] ... assigned team=... agent=...` /
+  `[injection-debug] ... headlessDefaultAssigned=true`。
+
 ### 3.6 thinking block 必填(anthropic 分支)
 
 DeepSeek 官方 anthropic 兼容端点在 thinking mode 下**硬校验**历史 assistant 必须
@@ -453,6 +486,12 @@ A: 不会。状态机代码是共用的(一套 CB init.ts),但 session key 里�
 **Q: dsh headless bypass 什么时候触发?**
 A: `body.tools` 非空但不包含 `ask_user_question` 时。典型场景:dsh 在 API 模式
 直调(自定义 tools 但无用户交互)。
+
+**Q: headless dsh 会话在 MemoryCore 里一直落在 `_unassigned/`,记忆不归并?**
+A: 这是 headless 跳过 session-init 的预期结果(没有 team_id,session trace 不带
+`x-tdai-team-id`)。要启用记忆归并,在 proxy `sessionInit` 段配置
+`defaultTeamId` + `defaultAgentId`(可选 `defaultTaskId`),见 §3.5.1。
+配好后首轮请求会直接把会话登记到该 team/agent;不配置则保持原行为。
 
 **Q: 为什么 dsh 需要 thinking / reasoning_content 占位?**
 A: DeepSeek 官方 anthropic/openai 兼容端点在 thinking mode 下对 assistant 消息硬

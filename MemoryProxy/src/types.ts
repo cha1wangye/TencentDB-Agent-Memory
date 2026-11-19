@@ -287,8 +287,32 @@ export interface SessionInitConfig {
    * 检索隔离（主维度为 team/user/agent/session）。
    *
    * 默认 "default"（开启）。若想关闭，在 YAML 中配为空字符串 `defaultTaskId: ""`。
+   *
+   * 同时被 headless dsh 的默认绑定复用（见 `defaultTeamId`）：取值不是虚拟
+   * 哨兵 "default"、且能在内核 task 列表里查到时，该 task 会作为默认绑定的
+   * task 维度写入；否则 headless 默认绑定只写 team + agent。
    */
   defaultTaskId?: string;
+  /**
+   * Headless（无 `ask_user_question` 工具）dsh 会话的默认 team 绑定。
+   *
+   * headless dsh 客户端弹不出 session-init 表单，会话会一直落在
+   * `sessions/online/_unassigned/...`，导致记忆永远不归并。配置此项 +
+   * `defaultAgentId` 后，proxy 在"headless dsh 请求"或"sessionInit.enabled=false
+   * 的 dsh 请求"上直接按此身份登记会话（等同走完表单的登记结果），而不弹表单。
+   *
+   * - 必须与 `defaultAgentId` 同时配置才生效；只配一个视为未启用。
+   * - 已初始化（已有绑定）的会话保持原绑定，不会被覆盖。
+   * - 未配置时行为与历史完全一致（headless 仍然 bypass / 不绑定）。
+   * - team / agent 会在登记前按内核可见列表做一次校验；校验失败只打日志，
+   *   不阻断请求（不会退回弹表单）。
+   */
+  defaultTeamId?: string;
+  /**
+   * Headless dsh 会话的默认 agent 绑定；必须与 `defaultTeamId` 同时配置，
+   * 且该 agent 必须在内核返回的 team 活跃 agent 列表里。
+   */
+  defaultAgentId?: string;
   /**
    * 跳过 asset_confirm 前置对话框，默认视为用户选了"是，关联团队资产"。
    * 开启后首轮直接进入 team → agent → task 选择流程（或 auto-select 级联）。
@@ -1079,6 +1103,8 @@ export interface RawYamlConfig {
     injectAgentContext?: boolean;
     injectTaskContext?: boolean;
     defaultTaskId?: string;
+    defaultTeamId?: string;
+    defaultAgentId?: string;
     /** 一步到位: 预选 team/agent 都命中时, 跳过 asset_confirm 直接 initialized。 */
     skipAssetConfirm?: boolean;
     debugForceIdentity?: {

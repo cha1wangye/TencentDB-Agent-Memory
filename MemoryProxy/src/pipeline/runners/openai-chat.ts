@@ -106,6 +106,11 @@ import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { emitModelIntentTelemetry } from "../../session/model-intent-telemetry.js";
 import { isExtractionAllowed, logExtractionSkipped } from "../../extraction-gate.js";
 import {
+  isDshHeadlessRequest,
+  resolveHeadlessDefaultAssignment,
+  ensureHeadlessDefaultAssignment,
+} from "../../session/headless-default-assignment.js";
+import {
   enforceRateLimit,
   isRateLimitExceededError,
   recordInputTokenUsage,
@@ -693,15 +698,10 @@ export async function runOpenaiChatPipeline(
   // 但走独立的 header-driven session-init 分支(见下方 opencode 特化块),
   // 因此不需要走这里的 headless bypass —— opencode 能吃 mem 命令纯文本响应,
   // 也需要 injection / L0 / skill 提取,只是不能弹 form。
-  const _dshHeadless = agentSource === "dsh" && (() => {
-    const tools = (body as { tools?: unknown }).tools;
-    if (!Array.isArray(tools) || tools.length === 0) return false;
-    return !tools.some((t) => {
-      const fn = (t as { function?: { name?: string }; name?: string })?.function;
-      const n = fn?.name ?? (t as { name?: string })?.name;
-      return n === "ask_user_question";
-    });
-  })();
+  //
+  // 判定实现收敛在 session/headless-default-assignment.ts::isDshHeadlessRequest
+  // (anthropic runner 共用同一判定, 避免两处漂移)。
+  const _dshHeadless = isDshHeadlessRequest(agentSource, body);
   if (_dshHeadless) {
     console.log(`[request-classify] session=${sessionKey} agent=dsh headless/no-preset (no ask_user_question tool) → bypass session-init, direct passthrough`);
   }
@@ -755,7 +755,46 @@ export async function runOpenaiChatPipeline(
    */
   let defaultBindingNotice: string | null = null;
   let _resetFlowResult: { agentName: string; agentIdShort: string; teamName?: string; teamId: string; taskName?: string | null; bypassed?: boolean } | null = null;
-  console.log(`[injection-debug] conversationId=${conversationId} sessionKey=${sessionKey} userId=${userId} agentSource=${agentSource} kind=${_requestKind} dshHeadless=${_dshHeadless} sessionInitEnabled=${config.sessionInit?.enabled} injectionEnabled=${config.injection?.enabled} injectors=${JSON.stringify(config.injection?.injectors)} injectedSkipped=${injectedSkipped} spaceId=${spaceId} teamMemoryEnabled=${teamMemoryEnabled}`);
+
+  // ── Headless dsh default assignment (opt-in) ─────────────────────────────
+  // 见 session/headless-default-assignment.ts: headless dsh 请求(或 sessionInit
+  // 整体关闭的 dsh 请求)在配置了 sessionInit.defaultTeamId + defaultAgentId 时,
+  // 直接按该身份登记会话 —— 否则会话永远没有 team_id, session trace 只能落到
+  // sessions/online/_unassigned/... 永不归并成记忆。
+  // 未配置默认值 / 已有绑定 / 交互式表单路径 → 不介入, 行为与历史一致。
+  const _headlessDefaults = resolveHeadlessDefaultAssignment({
+    config, agentSource, dshHeadless: _dshHeadless,
+    sessionInitEnabled: config.sessionInit?.enabled === true,
+  });
+  let _headlessAssigned = false;
+  if (_headlessDefaults && conversationId && !isAuxiliary && teamMemoryEnabled) {
+    try {
+      const { getMetadataClient } = await import("../../meta/client.js");
+      const _assigned = await ensureHeadlessDefaultAssignment({
+        sessionKey, userId: userId || null, spaceId, agentSource, config,
+        metadataClient: getMetadataClient(
+          config.coreSkill,
+          spaceId ?? "",
+          apiKey || config.tdai?.apiKey || "",
+        ),
+        userKey: apiKey || undefined,
+        messages: (body.messages as Array<Record<string, unknown>>) ?? [],
+        defaults: _headlessDefaults,
+      });
+      if (_assigned.sessionInfo) {
+        sessionInfo = _assigned.sessionInfo as unknown as Record<string, unknown>;
+        _headlessAssigned = _assigned.assigned;
+      }
+    } catch (err) {
+      // 默认绑定是 opt-in 的旁路能力, 绝不影响主链路。
+      console.warn(
+        "[session-init:dsh-default] assignment error: " +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+
+  console.log(`[injection-debug] conversationId=${conversationId} sessionKey=${sessionKey} userId=${userId} agentSource=${agentSource} kind=${_requestKind} dshHeadless=${_dshHeadless} headlessDefaultAssigned=${_headlessAssigned} sessionInitEnabled=${config.sessionInit?.enabled} injectionEnabled=${config.injection?.enabled} injectors=${JSON.stringify(config.injection?.injectors)} injectedSkipped=${injectedSkipped} spaceId=${spaceId} teamMemoryEnabled=${teamMemoryEnabled}`);
   if (config.sessionInit?.enabled && conversationId && !isAuxiliary && !_dshHeadless && teamMemoryEnabled) {
     try {
       // Round 18: session-init 主编排走 shared stageSessionInitOrchestrate;

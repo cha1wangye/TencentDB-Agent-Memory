@@ -135,15 +135,17 @@ export interface SessionInitState {
    * ClickHouse session_init_logs 的 preset_source 字段埋点。
    *
    * 枚举:
-   *   - "user_default" — 命中账户级默认 (本功能)
-   *   - "header"       — 命中 header preset (x-team-id/x-agent-id/x-task-id)
-   *   - "form"         — 走完交互表单
-   *   - undefined      — 老路径 / recovered / sidequery / bypass
+   *   - "user_default"   — 命中账户级默认 (user-session-default)
+   *   - "header"         — 命中 header preset (x-team-id/x-agent-id/x-task-id)
+   *   - "config_default" — 命中 headless dsh 的配置默认绑定
+   *                        (sessionInit.defaultTeamId/defaultAgentId)
+   *   - "form"           — 走完交互表单
+   *   - undefined        — 老路径 / recovered / sidequery / bypass
    *
    * 持久化到 state 是**必须的**: emitSessionInitTelemetryIfCompleted 在
    * handleSessionInit 的 finally 分支里读取, 彼时只有 state 是单一真源。
    */
-  presetSource?: "user_default" | "header" | "form";
+  presetSource?: "user_default" | "header" | "config_default" | "form";
 
   /**
    * v3.3 user-session-default: 账户默认未生效时的失败原因, 用于
