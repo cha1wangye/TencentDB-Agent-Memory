@@ -101,6 +101,11 @@ import type { TdaiIdentity, TdaiMessage } from "../../tdai/types.js";
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { emitModelIntentTelemetry } from "../../session/model-intent-telemetry.js";
 import { isExtractionAllowed, logExtractionSkipped } from "../../extraction-gate.js";
+import {
+  isDshHeadlessRequest,
+  resolveHeadlessDefaultAssignment,
+  ensureHeadlessDefaultAssignment,
+} from "../../session/headless-default-assignment.js";
 import type { CcRequestKind } from "../../common/cc-request-classifier.js";
 import { buildRequestDebugMetadata } from "../../common/langfuse-debug.js";
 import { resolveAgentAdapter } from "../../agent-adapters/index.js";
@@ -660,6 +665,18 @@ export async function runAnthropicPipeline(
   const conversationId = resolveConversationId(c);
   const sessionKey = conversationId ?? resolveSessionKey(config, lcHeaders, c.req.path, body, keyId);
 
+  // ── dsh headless detection (shared with openai-chat runner) ───────────────
+  // dsh v0.2+ 走 Anthropic Messages,但 headless / 未挂 ask-user preset 时
+  // body.tools 里没有 `ask_user_question`,弹不了表单。判定与 openai-chat 完全
+  // 同源 (session/headless-default-assignment.ts::isDshHeadlessRequest)。
+  //
+  // 注意: 这里**只**为 opt-in 的默认身份绑定服务 —— 未配置默认值时不会改变
+  // session-init 的既有行为 (仍走原表单/状态机路径)。
+  const _dshHeadless = isDshHeadlessRequest(agentSource, body);
+  if (_dshHeadless) {
+    console.log(`[request-classify] session=${sessionKey} agent=dsh headless/no-preset (no ask_user_question tool)`);
+  }
+
   // ── Auth verification (user_key → user_id) ──────────────────────────────────────
   // Reuse the early verify result — it ran before body parse to decide the
   // system-user short-circuit; running verify again here would double the
@@ -721,12 +738,51 @@ export async function runAnthropicPipeline(
   // content[] 最前插一个 text block。
   let defaultBindingNotice: string | null = null;
   let _resetFlowResult: { agentName: string; agentIdShort: string; teamName?: string; teamId: string; taskName?: string | null; bypassed?: boolean } | null = null;
-  console.log(`[injection-debug] conversationId=${conversationId} sessionKey=${sessionKey} userId=${userId} agentSource=${agentSource} sessionInitEnabled=${config.sessionInit?.enabled} injectionEnabled=${config.injection?.enabled} injectors=${JSON.stringify(config.injection?.injectors)} injectedSkipped=${injectedSkipped} teamMemoryEnabled=${teamMemoryEnabled}`);
   // CC 分流：SIDEQUERY 完全跳过 session-init（独立小请求无对话概念）。
   //          FORK 允许走 L2b recovery 复用 MAIN 已建的 session,但不进 form 交互路径
   //          （借用 MAIN 的 sessionInfo，见下方的 kind === 'fork' 分支保护）。
   const skipSessionInit = requestKind === "sidequery" || legacyProxy;
-  if (config.sessionInit?.enabled && conversationId && !skipSessionInit && teamMemoryEnabled) {
+
+  // ── Headless dsh default assignment (opt-in) ─────────────────────────────
+  // 见 session/headless-default-assignment.ts: headless dsh 请求(或 sessionInit
+  // 整体关闭的 dsh 请求)在配置了 sessionInit.defaultTeamId + defaultAgentId 时,
+  // 直接按该身份登记会话 —— 否则会话永远没有 team_id, session trace 只能落到
+  // sessions/online/_unassigned/... 永不归并成记忆。
+  // 未配置默认值 / 已有绑定 / 交互式表单路径 → 不介入, 行为与历史一致。
+  const _headlessDefaults = resolveHeadlessDefaultAssignment({
+    config, agentSource, dshHeadless: _dshHeadless,
+    sessionInitEnabled: config.sessionInit?.enabled === true,
+  });
+  let _headlessAssigned = false;
+  if (_headlessDefaults && conversationId && memoryTurn && teamMemoryEnabled) {
+    try {
+      const { getMetadataClient } = await import("../../meta/client.js");
+      const _assigned = await ensureHeadlessDefaultAssignment({
+        sessionKey, userId: userId || null, spaceId, agentSource, config,
+        metadataClient: getMetadataClient(config.coreSkill, spaceId ?? "", apiKey),
+        userKey: apiKey || undefined,
+        messages: (body.messages as Array<Record<string, unknown>>) ?? [],
+        defaults: _headlessDefaults,
+      });
+      if (_assigned.sessionInfo) {
+        sessionInfo = _assigned.sessionInfo as unknown as Record<string, unknown>;
+        _headlessAssigned = _assigned.assigned;
+      }
+    } catch (err) {
+      // 默认绑定是 opt-in 的旁路能力, 绝不影响主链路。
+      console.warn(
+        "[session-init:dsh-default] assignment error: " +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+
+  console.log(`[injection-debug] conversationId=${conversationId} sessionKey=${sessionKey} userId=${userId} agentSource=${agentSource} dshHeadless=${_dshHeadless} headlessDefaultAssigned=${_headlessAssigned} sessionInitEnabled=${config.sessionInit?.enabled} injectionEnabled=${config.injection?.enabled} injectors=${JSON.stringify(config.injection?.injectors)} injectedSkipped=${injectedSkipped} teamMemoryEnabled=${teamMemoryEnabled}`);
+  // headless dsh 配了默认绑定后不再弹表单（客户端没有 ask_user_question，
+  // 强弹会渲染成 unknown tool）。登记失败也只是保持不绑定，不回退表单。
+  // 只在主对话轮生效：aux（compaction / title）请求保持既有分类路径。
+  const skipSessionInitForHeadlessDefault = !!_headlessDefaults && _dshHeadless && memoryTurn;
+  if (config.sessionInit?.enabled && conversationId && !skipSessionInit && !skipSessionInitForHeadlessDefault && teamMemoryEnabled) {
     try {
       // Round 18: session-init 主编排走 shared stageSessionInitOrchestrate;
       // anthropic 4 个 callback:

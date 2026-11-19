@@ -711,6 +711,26 @@ sessionInit:
     taskHeader: "x-task-id"  # 携带 task_id 的请求头名（可选）
     onMismatch: "form"       # header 值查不到时：form=回退交互表单（默认）| bypass=跳过 session init
 
+  # ── Headless 客户端默认绑定（opt-in） ──────────────────────────────────────
+  # dsh 在 headless / 未挂 ask_user_question preset 时弹不出表单，会话会一直
+  # 落在 MemoryCore 的 sessions/online/_unassigned/... 下，永远不归并成记忆。
+  # 同时配置下面两个字段后，proxy 对「headless dsh 请求」和「sessionInit.enabled
+  # =false 的 dsh 请求」直接按该身份登记会话（登记结果与走完表单完全一致），
+  # 不弹表单，也不改写请求 prompt。
+  #
+  # - 只配一个视为未启用；两项都不配 → 行为与历史完全一致（headless 仍 bypass）。
+  # - 登记前会用内核列表校验：team / agent 不可见 → 只打日志并保持未绑定；
+  #   task 查不到 → 降级为只绑 team + agent，不阻断绑定。
+  # - 已初始化的会话保持原绑定，不会被覆盖；交互式请求（带 ask_user_question
+  #   且 sessionInit.enabled=true）完全不走这条路径。
+  # defaultTeamId: "team-xxxxxxxxxx"
+  # defaultAgentId: "agt-xxxxxxxxxx"
+  #
+  # defaultTaskId 同时是「交互表单跳过 task」与「headless 默认绑定 task」的配置：
+  #   - 默认值 "default" 是虚拟哨兵 = 不绑定任何 task（只写 team + agent）；
+  #   - 配成真实 task_id 且内核 task 列表里能查到时，会话一并绑定该 task。
+  # defaultTaskId: "default"
+
   # ── DEBUG：本地开发/e2e 短路 ────────────────────────────────────────────────
   # 打开 debugForceIdentity 后，agentSource=workbuddy 和 agentSource=codebuddy
   # 的会话会**直接**注册为固定三元组，绕过所有表单/header 匹配逻辑；

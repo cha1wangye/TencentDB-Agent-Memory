@@ -542,6 +542,14 @@ export function buildConfig(
     defaultTaskId: typeof yaml.sessionInit?.defaultTaskId === "string"
       ? (yaml.sessionInit.defaultTaskId.trim() || undefined)   // empty string → disabled
       : DEFAULT_CONFIG.sessionInit.defaultTaskId,
+    // headless dsh 默认绑定：必须 team + agent 同时配置才生效，只配一个 = 未启用。
+    // 与 defaultTaskId 不同，这两个字段**没有**内置默认值（默认 undefined = 关闭）。
+    defaultTeamId: typeof yaml.sessionInit?.defaultTeamId === "string"
+      ? (yaml.sessionInit.defaultTeamId.trim() || undefined)
+      : undefined,
+    defaultAgentId: typeof yaml.sessionInit?.defaultAgentId === "string"
+      ? (yaml.sessionInit.defaultAgentId.trim() || undefined)
+      : undefined,
     skipAssetConfirm: yaml.sessionInit?.skipAssetConfirm ?? DEFAULT_CONFIG.sessionInit.skipAssetConfirm,
     headerAutoSelect: {
       enabled: yaml.sessionInit?.headerAutoSelect?.enabled ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.enabled,
