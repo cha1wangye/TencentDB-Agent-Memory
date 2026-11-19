@@ -34,9 +34,13 @@
 import type { ProxyConfig, SessionInitConfig } from "../types.js";
 import type { AgentEntity, MetadataClient, TaskEntity, TeamEntity } from "../meta/client.js";
 import type { SessionInfo, SessionInitState, TeamOption } from "./types.js";
-import { getSessionStore, type SessionStore } from "./store.js";
-import { completeRegistration } from "./codebuddy/init.js";
-import { emitSessionInitTelemetryIfCompleted } from "./init-telemetry.js";
+import type { SessionStore } from "./store.js";
+
+// NOTE: 本模块被两个 runner **静态** import（每个请求都会走到判定），因此这里
+// 刻意只用 type import + 函数内 dynamic import 拿 store / completeRegistration /
+// 埋点 sink —— 保持 session-init 那一大坨模块（CB 状态机 / 表单 builder /
+// clickhouse）仍然只在真正需要绑定的时候才加载，未配默认值的部署加载图与历史
+// 完全一致。
 
 /** Structured log prefix (grep-friendly). */
 const TAG = "[session-init:dsh-default]";
@@ -180,9 +184,16 @@ export async function ensureHeadlessDefaultAssignment(
     return EMPTY_RESULT;
   }
 
-  const store = input.store ?? getSessionStore();
+  const store = input.store ?? (await import("./store.js")).getSessionStore();
   const compositeKey = `${input.agentSource}:${input.sessionKey}`;
   const messages = input.messages ?? [];
+  /** 「这条 state 真的带了一份可用绑定」—— 空 team/agent 的恢复态不算绑定。 */
+  const isBound = (state: SessionInitState | undefined): boolean =>
+    !!state &&
+    state.status === "initialized" &&
+    !state.bypassed &&
+    !!state.sessionInfo?.team_id &&
+    !!state.sessionInfo?.agent_id;
 
   // Step 1: 已有绑定优先（含 bypass 终态 —— 用户/历史明确选择过，不覆盖）。
   //
@@ -190,12 +201,12 @@ export async function ensureHeadlessDefaultAssignment(
   // 主链路那样每轮探测 L2a（每轮一次远端 GET）。mem:session-reset 会清掉
   // store 里的 key，届时走下面的 getOrRecover 重新判定。
   const l1 = store.get(compositeKey);
-  if (l1?.status === "initialized" && !l1.bypassed && l1.sessionInfo) {
+  if (isBound(l1)) {
     console.log(
-      `${TAG} session=${compositeKey} L1 bound team=${l1.sessionInfo.team_id} ` +
-        `agent=${l1.sessionInfo.agent_id} → keep existing assignment`,
+      `${TAG} session=${compositeKey} L1 bound team=${l1!.sessionInfo!.team_id} ` +
+        `agent=${l1!.sessionInfo!.agent_id} → keep existing assignment`,
     );
-    return { sessionInfo: l1.sessionInfo, assigned: false, keptExisting: true };
+    return { sessionInfo: l1!.sessionInfo!, assigned: false, keptExisting: true };
   }
 
   let existing: SessionInitState | undefined;
@@ -216,16 +227,19 @@ export async function ensureHeadlessDefaultAssignment(
     );
     existing = store.get(compositeKey);
   }
-  if (existing?.status === "initialized") {
-    if (existing.sessionInfo && !existing.bypassed) {
-      console.log(
-        `${TAG} session=${compositeKey} already bound team=${existing.sessionInfo.team_id} ` +
-          `agent=${existing.sessionInfo.agent_id} → keep existing assignment`,
-      );
-      return { sessionInfo: existing.sessionInfo ?? null, assigned: false, keptExisting: true };
-    }
+  if (isBound(existing)) {
     console.log(
-      `${TAG} session=${compositeKey} already initialized (bypassed=${existing.bypassed === true}) → keep as-is`,
+      `${TAG} session=${compositeKey} already bound team=${existing!.sessionInfo!.team_id} ` +
+        `agent=${existing!.sessionInfo!.agent_id} → keep existing assignment`,
+    );
+    return { sessionInfo: existing!.sessionInfo!, assigned: false, keptExisting: true };
+  }
+  if (existing?.status === "initialized") {
+    // 终态但没绑定（用户选了"本次不关联"，或恢复出来的绑定缺 team）：尊重既有
+    // 终态，不覆盖 —— 「已有 assignment 的会话保持原样」。
+    console.log(
+      `${TAG} session=${compositeKey} already initialized without a binding ` +
+        `(bypassed=${existing.bypassed === true}) → keep as-is`,
     );
     return { ...EMPTY_RESULT, keptExisting: true };
   }
@@ -328,6 +342,7 @@ export async function ensureHeadlessDefaultAssignment(
 
   const prevStatus = existing?.status ?? "uninitialized";
   try {
+    const { completeRegistration } = await import("./codebuddy/init.js");
     const result = await completeRegistration(
       { agent_id: agent.agent_id, ...(task ? { task_id: task.task_id } : {}) },
       seedState,
@@ -365,12 +380,17 @@ export async function ensureHeadlessDefaultAssignment(
   } finally {
     // 与 handleSessionInit 的装饰器一致：只在非 initialized → initialized 时埋点。
     // 注意这是 headless 的配置默认绑定（preset_source="config_default"），
-    // 不代表用户看到了任何表单。
-    emitSessionInitTelemetryIfCompleted({
-      store,
-      compositeKey,
-      prevStatus,
-      agentSource: input.agentSource,
-    });
+    // 不代表用户看到了任何表单。埋点本身绝不抛错。
+    try {
+      const { emitSessionInitTelemetryIfCompleted } = await import("./init-telemetry.js");
+      emitSessionInitTelemetryIfCompleted({
+        store,
+        compositeKey,
+        prevStatus,
+        agentSource: input.agentSource,
+      });
+    } catch {
+      /* telemetry import/sink failure must not affect the request */
+    }
   }
 }

@@ -283,6 +283,60 @@ describe("ensureHeadlessDefaultAssignment", () => {
     expect(metadata.getAgent).toHaveBeenCalledWith("agt-1");
   });
 
+  it("reuses the L1 binding on later turns without re-validating with the kernel", async () => {
+    const store = new SessionStore();
+    const config = makeConfig({ defaultTeamId: "team-1", defaultAgentId: "agt-1" });
+    const args = {
+      sessionKey: "session-l1",
+      userId: "usr-1",
+      agentSource: "dsh",
+      config,
+      userKey: "sk-mem-test",
+      messages: [],
+      store,
+      defaults: HEADLESS_DEFAULTS,
+    };
+
+    const first = await ensureHeadlessDefaultAssignment({ ...args, metadataClient: makeMetadata().client });
+    expect(first.assigned).toBe(true);
+
+    const secondMetadata = makeMetadata();
+    const second = await ensureHeadlessDefaultAssignment({ ...args, metadataClient: secondMetadata.client });
+    expect(second.assigned).toBe(false);
+    expect(second.keptExisting).toBe(true);
+    expect(second.sessionInfo?.team_id).toBe("team-1");
+    // Steady state must not hit the kernel again on every headless turn.
+    expect(secondMetadata.listTeams).not.toHaveBeenCalled();
+  });
+
+  it("respects a terminal bypassed state instead of assigning over it", async () => {
+    const store = new SessionStore();
+    await store.set("dsh:session-bypass", {
+      status: "initialized",
+      keyId: "session-bypass",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      bypassed: true,
+      sessionInfo: null,
+    });
+    const metadata = makeMetadata();
+
+    const result = await ensureHeadlessDefaultAssignment({
+      sessionKey: "session-bypass",
+      userId: "usr-1",
+      agentSource: "dsh",
+      config: makeConfig({ defaultTeamId: "team-1", defaultAgentId: "agt-1" }),
+      metadataClient: metadata.client,
+      messages: [],
+      store,
+      defaults: HEADLESS_DEFAULTS,
+    });
+
+    expect(result.assigned).toBe(false);
+    expect(result.keptExisting).toBe(true);
+    expect(metadata.listTeams).not.toHaveBeenCalled();
+  });
+
   it("keeps an existing assignment instead of overwriting it", async () => {
     const store = new SessionStore();
     await store.set("dsh:session-1", {
